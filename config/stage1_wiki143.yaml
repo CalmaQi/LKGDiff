@@ -1,0 +1,93 @@
+output_dir: output_diff
+# checkpoint: XXX
+dataset:
+  class: TransductiveDataset
+  graphs: [wiki143]
+  root: xxx/wiki143
+
+model:
+  class: Ultra
+  relation_model:
+    class: RelNBFNet
+    num_relation: 218
+    num_nodes: 13928
+    input_dim: 64
+    hidden_dims: [64, 64, 64, 64, 64, 64]
+    message_func: dismult
+    aggregate_func: sum
+    short_cut: yes
+    layer_norm: yes
+  entity_model:
+    class: EntityNBFNet
+    input_dim: 64
+    hidden_dims: [64, 64, 64, 64, 64, 64]
+    message_func: dismult
+    aggregate_func: sum
+    short_cut: yes
+    layer_norm: yes
+  vq_model:
+    tokens: 4
+    dim: 128
+    encoder_hidden_dim: 512
+    z_dim: 16
+    # rel_dim: 64
+    codebook_size: 8192
+    label_smoothing: 0.0
+    pos_weight_max: 5000000
+    usage_lambda: 0.05
+    beta: 0.25
+    has_empty_class: no
+    ema: no
+    num_neg_samples: 10
+    # reasoning_enabled: no
+    # latent_replace_warmup_epochs: 400
+    # latent_replace_weight: 1.0
+diffusion:
+  T: 100
+  hidden: 128
+  cond_dim: 128
+  # checkpoint:
+task:
+  name: MultiGraphPretraining
+  num_negative: 512
+  strict_negative: yes
+  adversarial_temperature: 1
+  metric: [mr, mrr, hits@1, hits@3, hits@10]
+
+optimizer:
+  class: AdamW
+  lr: 5.0e-4
+  # lr: 5.0e-5
+
+scheduler:
+  # class: none
+  class: WarmupCosine
+  warmup_steps: 2000
+  min_lr_ratio: 0.1
+
+augment:
+  edge_drop: 0.99
+  edge_drop_schedule:
+    mode: linear  
+    start: 0.0    
+    end: 0.6      
+
+train:
+  gpus: {{ gpus }}
+  batch_size: 128  
+  num_epoch: 1000 #
+  log_interval: 10
+  batch_per_epoch: 80000
+  fast_test: 500
+  epoch_pergraph: 100
+  vq_chunk: 32
+  net_chunk: 64
+  eval_interval: 10
+  ema: 
+    enabled: no #
+  stage_epochs: { identity: 0, ae: 0, vq: 6000 }
+
+  #logger: wandb
+
+test:
+  batch_size: 128
