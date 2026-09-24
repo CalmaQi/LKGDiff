@@ -31,7 +31,7 @@ model:
     encoder_hidden_dim: 512
     z_dim: 16
     # rel_dim: 64
-    codebook_size: 4096
+    codebook_size: 1024
     label_smoothing: 0.0
     pos_weight_max: 5000000
     usage_lambda: 0.05
@@ -42,13 +42,15 @@ model:
     # latent_replace_warmup_epochs: 400
     # latent_replace_weight: 1.0
 diffusion:
-  T: 100
+  T: 50
   hidden: 128
-  cond_dim: 512
+  cond_dim: 128
+  beta_min: 2.0e-3
+  beta_max: 4.0e-1
   # checkpoint:
 task:
   name: MultiGraphPretraining
-  num_negative: 512
+  num_negative: 256
   strict_negative: yes
   adversarial_temperature: 1
   metric: [mr, mrr, hits@1, hits@3, hits@10]

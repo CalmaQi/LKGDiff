@@ -12,7 +12,7 @@ model:
     num_relation: 218
     num_nodes: 13928
     input_dim: 64
-    hidden_dims: [64, 64, 64, 64, 64, 64]
+    hidden_dims: [32, 32, 32, 32, 32, 32]
     message_func: dismult
     aggregate_func: sum
     short_cut: yes
@@ -20,7 +20,7 @@ model:
   entity_model:
     class: EntityNBFNet
     input_dim: 64
-    hidden_dims: [64, 64, 64, 64, 64, 64]
+    hidden_dims: [32, 32, 32, 32, 32, 32]
     message_func: dismult
     aggregate_func: sum
     short_cut: yes
@@ -31,7 +31,7 @@ model:
     encoder_hidden_dim: 512
     z_dim: 16
     # rel_dim: 64
-    codebook_size: 8192
+    codebook_size: 2048
     label_smoothing: 0.0
     pos_weight_max: 5000000
     usage_lambda: 0.05
@@ -43,13 +43,17 @@ model:
     # latent_replace_warmup_epochs: 400
     # latent_replace_weight: 1.0
 diffusion:
-  T: 100
-  hidden: 128
-  cond_dim: 128
+  T: 50
+  hidden: 64
+  cond_dim: 64
+  time_dim: 64
+  num_layers: 2
+  beta_min: 0.002
+  beta_max: 0.4
   # checkpoint:
 task:
   name: MultiGraphPretraining
-  num_negative: 512
+  num_negative: 256
   strict_negative: yes
   adversarial_temperature: 1
   metric: [mr, mrr, hits@1, hits@3, hits@10]
