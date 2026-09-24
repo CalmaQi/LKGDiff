@@ -29,9 +29,11 @@ def mr_ou_schedule(T: int, kappa: float = 4.0, sigma_inf: float = 1.0) -> Tuple[
       alphas: (T,)
       sigmas: (T,)
     """
-    tau = torch.linspace(0.0, 1.0, steps=T, dtype=torch.float32)
-    alphas = torch.exp(-kappa * tau).clamp(1e-6, 1.0)
-    sigmas = sigma_inf * torch.sqrt(torch.clamp(1.0 - alphas ** 2, min=0.0))
+    # Linear-DDPM schedule.  Keep the old function name for checkpoint/API
+    # compatibility; returned alphas are cumulative alpha-bars.
+    beta = torch.linspace(1e-4, 2e-2, steps=T, dtype=torch.float32)
+    alphas = torch.cumprod(1.0 - beta, dim=0).clamp(1e-6, 1.0)
+    sigmas = torch.sqrt(torch.clamp(1.0 - alphas, min=0.0))
     return alphas.float(), sigmas.float()
 
 
@@ -291,6 +293,19 @@ class MergeDenoiser(nn.Module):
         
         self.blocks = nn.ModuleList(blocks)
 
+        # Relation-wise attention mixes the relation/token axis; node-wise
+        # attention mixes heads/nodes. Both use the linear-attention kernel.
+        self.relation_attn = nn.ModuleList([
+            LinearAttention(hidden, tlen=tokens, heads=heads,
+                            dim_head=dim_head, axis="tokens")
+            for _ in range(layers)
+        ])
+        self.node_attn = nn.ModuleList([
+            LinearAttention(hidden, tlen=tokens, heads=heads,
+                            dim_head=dim_head, axis="nodes")
+            for _ in range(layers)
+        ])
+
         self.proj_out = nn.Sequential(
             nn.LayerNorm(hidden),
             nn.Linear(hidden, dim),
@@ -333,7 +348,10 @@ class MergeDenoiser(nn.Module):
             t_emb = self.time_mlp(t_emb)
             h = self.time_film(h, t_emb)
 
-            for attn_t, ffn in self.blocks:
+            for i, (attn_t, ffn) in enumerate(self.blocks):
+                # relation-wise and node-wise linear attention residuals
+                h = h + self.relation_attn[i](F.layer_norm(h, (h.shape[-1],)))
+                h = h + self.node_attn[i](F.layer_norm(h, (h.shape[-1],)))
                 h = attn_t(h)
                 h = ffn(h)
 
@@ -381,6 +399,10 @@ class TokenDiffusionMR(nn.Module):
         self.eta = float(eta)
 
         alphas, sigmas = mr_ou_schedule(self.T, kappa=self.kappa, sigma_inf=self.sigma_inf)
+        alpha_prev = torch.cat([torch.ones(1), alphas[:-1]])
+        beta = (1.0 - alphas / alpha_prev).clamp(1e-5, 0.999)
+        self.register_buffer("betas", beta)
+        self.register_buffer("alpha_prev", alpha_prev)
         self.register_buffer("alphas", alphas)
         self.register_buffer("sigmas", sigmas)
 
@@ -464,7 +486,8 @@ class TokenDiffusionMR(nn.Module):
             s_t = s_t.unsqueeze(0)
 
         noise = torch.randn_like(x0)
-        x_t = a_t * x0 + (1.0 - a_t) * known_x0 + s_t * noise
+        # DDPM q(x_t | x_0), with known_x0 used as the conditioning center.
+        x_t = torch.sqrt(a_t) * x0 + (1.0 - torch.sqrt(a_t)) * known_x0 + s_t * noise
         return x_t, noise
 
     def predict_residual(
@@ -593,14 +616,16 @@ class TokenDiffusionMR(nn.Module):
                 num_nodes=num_nodes,
             )
 
-            t_prev = torch.clamp(ti - 1, min=0)
-            a_prev = self.alphas[t_prev]
-            s_prev = self.sigmas[t_prev]
-            mean_prev = a_prev * x0_hat_head + (1.0 - a_prev) * known_head
-
-            if (ti.item() > 0) and (self.eta > 0.0):
-                noise = torch.randn_like(x)
-                x = mean_prev + (self.eta * s_prev) * noise
+            # DDPM posterior q(x_{t-1}|x_t,x_0_hat), with t=0 deterministic.
+            a_bar = self.alphas[ti]
+            a_bar_prev = self.alpha_prev[ti]
+            beta_t = self.betas[ti]
+            coef_x0 = torch.sqrt(a_bar_prev) * beta_t / (1.0 - a_bar)
+            coef_xt = torch.sqrt(1.0 - beta_t) * (1.0 - a_bar_prev) / (1.0 - a_bar)
+            mean_prev = coef_x0 * x0_hat_head + coef_xt * x
+            if ti.item() > 0 and self.eta > 0.0:
+                posterior_var = beta_t * (1.0 - a_bar_prev) / (1.0 - a_bar)
+                x = mean_prev + self.eta * torch.sqrt(posterior_var.clamp_min(1e-20)) * torch.randn_like(x)
             else:
                 x = mean_prev
 
