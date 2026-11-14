@@ -112,11 +112,11 @@ Stage II loads and freezes the Stage-I autoencoder, trains the diffusion model, 
 
 If you find this work useful, please cite:
 
-```bibtex
+<!-- ```bibtex
 @article{wang2026local,
   title={From Local Recovery to Unified Generation: Discovering Triple Set in Knowledge Graphs via Observation-Anchored Latent Diffusion},
   author={Wang, Jiaqi and Gao, Yisen and Shi, Huayang and Hou, Junhao and Li, Wengen and Guan, Jihong and Zhang, Yichao and Zhou, Shuigeng and Song, Yangqiu and Cheng, Hong},
   journal={arXiv preprint arXiv:2610.39114},
   year={2026}
 }
-```
+``` -->
