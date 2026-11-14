@@ -1,5 +1,5 @@
 output_dir: output_diff
-# checkpoint: 
+# checkpoint:
 dataset:
   class: TransductiveDataset
   graphs: [cfmaily]
@@ -94,13 +94,13 @@ augment:
   ratio_observed: 0.8
   edge_drop: 0.99
   edge_drop_schedule:
-    mode: linear  
-    start: 0.0    
-    end: 0.99      
+    mode: linear
+    start: 0.0
+    end: 0.99
 
 train:
   gpus: {{ gpus }}
-  batch_size: 1500  
+  batch_size: 1500
   num_epoch: 10000 #
   log_interval: 10
   batch_per_epoch: 80000
@@ -111,7 +111,7 @@ train:
   eval_interval: 100
   # enable_vis: no
   # vis_interval: 2000
-  ema: 
+  ema:
     enabled: no #
   stage_epochs: { identity: 0, ae: 0, vq: 500 }
 

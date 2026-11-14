@@ -11,9 +11,9 @@ class TransductiveDataset(InMemoryDataset):
 
     delimiter = None
     name = ""
-    urls = [   
+    urls = [
     ]
-    
+
     def __init__(self, root, transform=None, pre_transform=None, **kwargs):
 
         super().__init__(root, transform, pre_transform)
@@ -22,12 +22,12 @@ class TransductiveDataset(InMemoryDataset):
     @property
     def raw_file_names(self):
         return ["train.txt", "valid.txt", "test.txt"]
-    
+
     def download(self):
         for url, path in zip(self.urls, self.raw_paths):
             download_path = download_url(url, self.raw_dir)
             os.rename(download_path, path)
-    
+
     def load_file(self, triplet_file, inv_entity_vocab={}, inv_rel_vocab={}):
 
         triplets = []
@@ -56,21 +56,21 @@ class TransductiveDataset(InMemoryDataset):
             "inv_entity_vocab": inv_entity_vocab,
             "inv_rel_vocab": inv_rel_vocab
         }
-    
+
     # default loading procedure: process train/valid/test files, create graphs from them
     def process(self):
 
         train_files = self.raw_paths[:3]
 
         train_results = self.load_file(train_files[0], inv_entity_vocab={}, inv_rel_vocab={})
-        valid_results = self.load_file(train_files[1], 
+        valid_results = self.load_file(train_files[1],
                         train_results["inv_entity_vocab"], train_results["inv_rel_vocab"])
         test_results = self.load_file(train_files[2],
                         train_results["inv_entity_vocab"], train_results["inv_rel_vocab"])
-        
+
         # in some datasets, there are several new nodes in the test set, eg 123,143 YAGO train adn 123,182 in YAGO test
         # for consistency with other experimental results, we'll include those in the full vocab and num nodes
-        num_node = test_results["num_node"] 
+        num_node = test_results["num_node"]
         # the same for rels: in most cases train == test for transductive
         # for AristoV4 train rels 1593, test 1604
         num_relations = test_results["num_relation"]
@@ -108,7 +108,7 @@ class TransductiveDataset(InMemoryDataset):
 
     def __repr__(self):
         return "%s()" % (self.name)
-    
+
     @property
     def num_relations(self):
         return int(self.data.edge_type.max()) + 1
@@ -124,6 +124,3 @@ class TransductiveDataset(InMemoryDataset):
     @property
     def processed_file_names(self):
         return "data.pt"
-
-
-
