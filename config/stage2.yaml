@@ -74,8 +74,8 @@ task:
 
 evaluation:
   assumption: cwa
-  threshold_split: test
-  threshold_steps: 30
+  threshold_split: test  # Stage II: valid (or validation) / test
+  threshold_steps: 30  # Number of threshold candidates
 
 optimizer:
   class: Adam

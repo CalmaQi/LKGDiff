@@ -507,6 +507,8 @@ def evaluate(cfg, vq_model: VQpretrain, diff_model: TokenDiffusion, data_incompl
         raise ValueError(f"Unsupported evaluation assumption: {assumption}")
     use_powa = assumption == "rs_powa"
     threshold_split = str(_get_cfg_value(cfg, "evaluation", "threshold_split", "validation")).lower()
+    if threshold_split == "valid":
+        threshold_split = "validation"
     if threshold_split not in ("validation", "test"):
         raise ValueError(f"Unsupported threshold_split: {threshold_split}")
 

@@ -60,6 +60,8 @@ task:
   metric: [mr, mrr, hits@1, hits@3, hits@10]
 
 evaluation:
+  threshold_split: valid  # Stage II: valid (or validation) / test
+  threshold_steps: 10  # Number of threshold candidates
   assumption: rs_powa
 
 optimizer:

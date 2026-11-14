@@ -6,9 +6,9 @@
 
 **A unified latent generative framework for knowledge graph triple set prediction**
 
-[![arXiv](https://img.shields.io/badge/arXiv-2610.39114-b31b1b.svg)](https://arxiv.org/abs/2610.39114)
+<!-- [![arXiv](https://img.shields.io/badge/arXiv-2610.39114-b31b1b.svg)](https://arxiv.org/abs/2610.39114) -->
 
-[**View on arXiv**](https://arxiv.org/abs/2610.39114)
+<!-- [**View on arXiv**](https://arxiv.org/abs/2610.39114) -->
 
 </div>
 
