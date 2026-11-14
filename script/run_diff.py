@@ -2,6 +2,7 @@ import os
 import math
 import pprint
 import ast
+import json
 import torch
 import random
 import numpy as np
@@ -212,19 +213,19 @@ def _build_graph_from_indices(
     return g
 
 
-def split_uncomplete_complete(train_data: Data, ratio_uncomplete: float = 0.8,
-                              extra_ratio_range=(0.15, 0.20), device=None):
+def split_uncomplete_complete(train_data: Data, ratio_target_range=(0.7, 1.0),
+                              ratio_observed: float = 0.8, device=None):
     """
-    Based on train target edges, stratified sampling by relation:
-      - uncompletekg: keep floor(0.8*nr) for each relation
-      - completekg: take floor(u*nr) from remaining edges (u~Uniform[0.15,0.20]), merge with uncomplete
+    Sample a target graph and then an observed subset, stratified by relation:
+      - completekg: retain rho_tar of each relation, rho_tar~Uniform(ratio_target_range)
+      - uncompletekg: retain rho_obs of the target triples
     Returns: uncompletekg, completekg (Data)
     """
     device = device or getattr(train_data.edge_index, "device", None)
     ei, et = _get_target_edges(train_data)
     E = ei.size(1)
-    
-    # Stratified sampling by relation
+    ratio_target = random.uniform(*ratio_target_range)
+
     keep_u_list, keep_c_list = [], []
     uniq = torch.unique(et)
     for r in uniq.tolist():
@@ -232,16 +233,13 @@ def split_uncomplete_complete(train_data: Data, ratio_uncomplete: float = 0.8,
         nr = idx.numel()
         if nr == 0:
             continue
-        k_u = int(math.floor(nr * ratio_uncomplete))
-        k_u = max(0, min(nr, k_u))
-        k_x = int(math.floor(nr * random.uniform(extra_ratio_range[0], extra_ratio_range[1])))
-        k_x = max(0, min(nr - k_u, k_x))
+        k_c = max(0, min(nr, int(math.floor(nr * ratio_target))))
         perm = idx[torch.randperm(nr, device=idx.device)]
-        sel_u = perm[:k_u]
-        remain = perm[k_u:]
-        sel_x = remain[:k_x] if k_x > 0 else torch.empty(0, dtype=perm.dtype, device=perm.device)
+        sel_c = perm[:k_c]
+        k_u = max(0, min(k_c, int(math.floor(k_c * ratio_observed))))
+        sel_u = sel_c[:k_u]
         keep_u_list.append(sel_u)
-        keep_c_list.append(torch.unique(torch.cat([sel_u, sel_x], dim=0)))
+        keep_c_list.append(sel_c)
 
     keep_u = torch.unique(torch.cat(keep_u_list, dim=0)) if keep_u_list else torch.arange(0, E, device=device)
     keep_c = torch.unique(torch.cat(keep_c_list, dim=0)) if keep_c_list else keep_u
@@ -409,22 +407,18 @@ def get_tokens(vq_model: VQpretrain, graph: Data, batch: torch.Tensor, use_soft_
 @torch.no_grad()
 def _build_forbidden_mask_for_heads(data: Data, valid_data, batch_heads: torch.Tensor, num_rel: int,
                                     num_nodes: int, device) -> torch.Tensor:
-    """
-    Returns forbidden mask (B,R,N), True means (h,r,t) already exists in data, needs to be masked during evaluation.
-    Usually pass train_data to mask known triples in training set.
-    """
+    """Mask known triples, optionally including an additional validation graph."""
     B = batch_heads.numel()
     mask = torch.zeros((B, num_rel, num_nodes), device=device, dtype=torch.bool)
-    
-    joint_data = build_joint_target_graph(data, valid_data, device=device)
-    
+
+    joint_data = data if valid_data is None else build_joint_target_graph(data, valid_data, device=device)
+
     H_all = joint_data.edge_index[0].to(device)
     T_all = joint_data.edge_index[1].to(device)
     R_all = getattr(joint_data, "edge_type", None)
     if R_all is not None:
         R_all = R_all.to(device)
     else:
-        # If no relation type, treat as class 0
         R_all = torch.zeros_like(T_all, device=device)
 
     head2b = torch.full((num_nodes,), -1, device=device, dtype=torch.long)
@@ -436,6 +430,37 @@ def _build_forbidden_mask_for_heads(data: Data, valid_data, batch_heads: torch.T
         t = T_all[sel].clamp_min(0).clamp_max(num_nodes - 1)
         mask[b, r, t] = True
     return mask
+
+
+def _merge_pair_rel_maps(*maps):
+    merged = {}
+    for pair_map in maps:
+        for key, rels in pair_map.items():
+            merged.setdefault(key, set()).update(rels)
+    return merged
+
+
+def _count_powa_negative(h, r, t, pair_rel_map, rel_map):
+    count = 0
+    for h_idx, r_pred, t_idx in zip(h, r, t):
+        rels_exist = pair_rel_map.get((int(h_idx), int(t_idx)))
+        if rels_exist and any(
+            not _relations_correspond(r_exist, int(r_pred), rel_map) for r_exist in rels_exist
+        ):
+            count += 1
+    return count
+
+
+def _compute_tsp_metrics(true_positive, pred_total, label_total, powa_negative=None):
+    cwa_precision = true_positive / max(1, pred_total)
+    if powa_negative is None:
+        jprecision = cwa_precision
+    else:
+        powa_precision = true_positive / max(1, true_positive + powa_negative)
+        jprecision = 0.5 * (cwa_precision + powa_precision)
+    st_recall = (true_positive / max(1, label_total)) ** 0.5
+    f_tsp = 2 * jprecision * st_recall / max(1e-8, jprecision + st_recall)
+    return jprecision, st_recall, f_tsp
 
 @torch.no_grad()
 def precompute_tokens_chunked(
@@ -468,11 +493,8 @@ def precompute_tokens_chunked(
 @torch.no_grad()
 def evaluate(cfg, vq_model: VQpretrain, diff_model: TokenDiffusion, data_incomplete: Data, data_complete: Data,
              device, logger, test_data,valid_data, writer: SummaryWriter = None, step: int = 0, guidance_scale: float = 0,
-             use_soft_vq: bool = True,tb_tag: str = "difftest"):
-    """
-    Condition uses data_incomplete, labels come from data_complete (should be joint(train,test) in this requirement).
-    Accumulate VQ in chunks, then feed into diffusion; evaluate logits by chunks to avoid peak.
-    """
+             use_soft_vq: bool = True,tb_tag: str = "difftest", return_details: bool = False):
+    """Select a threshold on the configured split; report the source with test metrics."""
     vq_model.eval(); diff_model.eval()
     num_nodes = int(data_complete.num_nodes)
     num_rel = int(vq_model.vq_vae.num_rel)
@@ -480,33 +502,41 @@ def evaluate(cfg, vq_model: VQpretrain, diff_model: TokenDiffusion, data_incompl
     has_empty = False
     vq_chunk = int(getattr(cfg.train, "vq_chunk", 2048))
 
-    # label graph (test + reverse)
-    reverse_edge_index = torch.stack([test_data.target_edge_index[1], test_data.target_edge_index[0]], dim=0)
-    reverse_edge_type = test_data.target_edge_type + int(test_data.target_edge_type.max().item()) + 1
-    label_edge_index = torch.cat([test_data.target_edge_index, reverse_edge_index], dim=1)
-    label_edge_type  = torch.cat([test_data.target_edge_type, reverse_edge_type],  dim=0)
-    label_graph = Data(edge_index=label_edge_index, edge_type=label_edge_type, num_nodes=test_data.num_nodes)
-    label_graph.num_relations = getattr(test_data, "num_relations", getattr(data_incomplete, "num_relations", 0))
+    assumption = str(_get_cfg_value(cfg, "evaluation", "assumption", "cwa")).lower()
+    if assumption not in ("cwa", "rs_powa"):
+        raise ValueError(f"Unsupported evaluation assumption: {assumption}")
+    use_powa = assumption == "rs_powa"
+    threshold_split = str(_get_cfg_value(cfg, "evaluation", "threshold_split", "validation")).lower()
+    if threshold_split not in ("validation", "test"):
+        raise ValueError(f"Unsupported threshold_split: {threshold_split}")
 
-    # Required for open-set error statistics: test triples, train+test (h,t)->rels, relation correspondence table
-    test_triples, _ = _build_triple_set_and_pair_rel_map(test_data)
-    train_triples, train_ht2rels = _build_triple_set_and_pair_rel_map(data_incomplete)
-    test_triples_for_pair, test_ht2rels = _build_triple_set_and_pair_rel_map(test_data)
-    _ = train_triples, test_triples_for_pair
-    joint_ht2rels = {}
-    for key, rels in train_ht2rels.items():
-        joint_ht2rels[key] = set(rels)
-    for key, rels in test_ht2rels.items():
-        if key not in joint_ht2rels:
-            joint_ht2rels[key] = set()
-        joint_ht2rels[key].update(rels)
+    def _make_label_graph(data):
+        reverse_edge_index = torch.stack([data.target_edge_index[1], data.target_edge_index[0]], dim=0)
+        reverse_edge_type = data.target_edge_type + int(data.target_edge_type.max().item()) + 1
+        label_edge_index = torch.cat([data.target_edge_index, reverse_edge_index], dim=1)
+        label_edge_type = torch.cat([data.target_edge_type, reverse_edge_type], dim=0)
+        graph = Data(edge_index=label_edge_index, edge_type=label_edge_type, num_nodes=data.num_nodes)
+        graph.num_relations = getattr(data, "num_relations", getattr(data_incomplete, "num_relations", 0))
+        return graph
 
-    rel_map_path = _resolve_relation_map_path(cfg)
+    valid_label_graph = _make_label_graph(valid_data)
+    label_graph = _make_label_graph(test_data)
+    threshold_label_graph = label_graph if threshold_split == "test" else valid_label_graph
+    threshold_known_data = valid_data if threshold_split == "test" else None
+
+    test_triples, test_ht2rels = _build_triple_set_and_pair_rel_map(test_data)
+    _, train_ht2rels = _build_triple_set_and_pair_rel_map(data_incomplete)
+    _, valid_ht2rels = _build_triple_set_and_pair_rel_map(valid_data)
+    valid_pair_rel_map = _merge_pair_rel_maps(train_ht2rels, valid_ht2rels)
+    test_pair_rel_map = _merge_pair_rel_maps(train_ht2rels, test_ht2rels)
+
+    rel_map_path = _resolve_relation_map_path(cfg) if use_powa else None
     rel_map = _load_relation_correspondence(rel_map_path)
-    if rel_map_path is None:
-        logger.warning(f"[{tb_tag}] relation map file not found; fallback to exact-relation matching only.")
-    else:
-        logger.warning(f"[{tb_tag}] relation map loaded: {rel_map_path}")
+    if use_powa:
+        if rel_map_path is None:
+            logger.warning(f"[{tb_tag}] relation map file not found; fallback to exact-relation matching only.")
+        else:
+            logger.warning(f"[{tb_tag}] relation map loaded: {rel_map_path}")
 
 
     # First accumulate known_x0_all / known_mask_all in chunks
@@ -524,76 +554,83 @@ def evaluate(cfg, vq_model: VQpretrain, diff_model: TokenDiffusion, data_incompl
                                                    incomplete_graph=data_incomplete, heads=heads, 
                                                    soft_vq=getattr(vq_model.vq_vae, "rvq", None) if use_soft_vq else None,)
         
-    # Threshold sweep counting
-    thr_grid = torch.linspace(0.2, 0.9999999, steps=10, device=device)
+    thr_grid = torch.linspace(0.2, 0.9999999, steps=int(_get_cfg_value(cfg, "evaluation", "threshold_steps", 10)), device=device)
     sweep_tp = torch.zeros_like(thr_grid, dtype=torch.long)
     sweep_fp = torch.zeros_like(thr_grid, dtype=torch.long)
     sweep_fn = torch.zeros_like(thr_grid, dtype=torch.long)
-    # Scheme A: cache tail_prob of each chunk to CPU, reuse by best_thr later to avoid repeated forward logits.
+    sweep_powa_negative = torch.zeros_like(thr_grid, dtype=torch.long)
     cached_tail_prob_cpu = []
     cached_ranges = []
-    
-    # Pre-allocate CPU logits container (only fill rows for heads managed by this rank)
-    logits_cpu = torch.empty((num_nodes, num_rel, num_nodes), dtype=torch.float32, device="cpu")
 
-    # Precompute logits -> CPU
+    logits_cpu = torch.empty((num_nodes, num_rel, num_nodes), dtype=torch.float32, device="cpu")
     for s in range(0, num_nodes, vq_chunk):
         e = min(num_nodes, s + vq_chunk)
         heads = torch.arange(s, e, device=device)
-        logits_chunk = vq_model.logits_from_head(z_tokens_all.squeeze(0)[s:e])  # (b,R,N)
+        logits_chunk = vq_model.logits_from_head(z_tokens_all.squeeze(0)[s:e])
         logits_cpu[heads.detach().cpu()] = logits_chunk.detach().float().cpu()
 
-    # Probability and forward/inverse relation averaging (on CPU)
-    tail_prob_cpu = torch.sigmoid(logits_cpu[..., :num_nodes])  # (N,R,N)
+    tail_prob_cpu = torch.sigmoid(logits_cpu[..., :num_nodes])
 
-    # Estimate forward/inverse relation offset and do symmetric averaging
-   
-    rel_offset = num_rel // 2  
+    rel_offset = num_rel // 2
     if rel_offset > 0 and num_rel >= rel_offset * 2:
-        r0 = torch.arange(rel_offset)         # Forward relation index set (K,)
-        r1 = r0 + rel_offset                  # Inverse relation index set (K,)
-
-        # A[h,k,t] = P(h, r0[k], t)
-        A = tail_prob_cpu[:, r0, :]           # (N,K,N)
-        # B[h,k,t] = P(h, r1[k], t); B_t[h,k,t] = P(t, r1[k], h)
-        B = tail_prob_cpu[:, r1, :]           # (N,K,N)
-        B_t = B.transpose(0, 2)               # (N,K,N) Swap head and tail dimensions
-
+        r0 = torch.arange(rel_offset)
+        r1 = r0 + rel_offset
+        A = tail_prob_cpu[:, r0, :]
+        B = tail_prob_cpu[:, r1, :]
+        B_t = B.transpose(0, 2)
         avg = 0.5 * (A + B_t)
-        # Write back symmetric sides: forward as avg, inverse as avg transpose (keep P(t,r_rev,h) corresponding)
         tail_prob_cpu[:, r0, :] = avg
         tail_prob_cpu[:, r1, :] = avg.transpose(0, 2)
 
     for s in range(0, num_nodes, vq_chunk):
         e = min(num_nodes, s + vq_chunk)
         heads = torch.arange(s, e, device=torch.device("cpu"))
-        labels = build_labels_for_heads(label_graph, heads, num_rel, num_nodes, has_empty, device=torch.device("cpu"))  # (b,R,N)
-        forbid = _build_forbidden_mask_for_heads(data_incomplete,valid_data, heads, num_rel, num_nodes, device=device)  # (b,R,N)
-        tail_prob = tail_prob_cpu[heads, :num_nodes].to(device).masked_fill(forbid, -1e9)
+        valid_labels = build_labels_for_heads(
+            threshold_label_graph, heads, num_rel, num_nodes, has_empty, device=torch.device("cpu")
+        )
+        valid_forbid = _build_forbidden_mask_for_heads(
+            data_incomplete, threshold_known_data, heads, num_rel, num_nodes, device=device
+        )
+        valid_prob = tail_prob_cpu[heads, :num_nodes].to(device).masked_fill(valid_forbid, 0.0)
+        valid_gt = valid_labels[..., :num_nodes].bool().to(device)
 
-        gt = labels[..., :num_nodes].bool()
-        gt = gt.to(device)
-        cached_tail_prob_cpu.append(tail_prob.detach().to(device="cpu", dtype=torch.float16))
-        cached_ranges.append((s, e))
         for i, thr in enumerate(thr_grid):
-            preds = tail_prob > thr
-            sweep_tp[i] += (preds & gt).sum()
-            sweep_fp[i] += (preds & (~gt)).sum()
-            sweep_fn[i] += ((~preds) & gt).sum()
+            preds = valid_prob > thr
+            sweep_tp[i] += (preds & valid_gt).sum()
+            sweep_fp[i] += (preds & (~valid_gt)).sum()
+            sweep_fn[i] += ((~preds) & valid_gt).sum()
+            if use_powa:
+                wrong = (preds & (~valid_gt)).nonzero(as_tuple=False).detach().cpu()
+                if wrong.numel() > 0:
+                    h = (wrong[:, 0] + s).numpy()
+                    r = wrong[:, 1].numpy()
+                    t = wrong[:, 2].numpy()
+                    sweep_powa_negative[i] += _count_powa_negative(h, r, t, test_pair_rel_map if threshold_split == "test" else valid_pair_rel_map, rel_map)
+
+        test_forbid = _build_forbidden_mask_for_heads(
+            data_incomplete, valid_data, heads, num_rel, num_nodes, device=device
+        )
+        test_prob = tail_prob_cpu[heads, :num_nodes].to(device).masked_fill(test_forbid, 0.0)
+        cached_tail_prob_cpu.append(test_prob.detach().to(device="cpu", dtype=torch.float32))
+        cached_ranges.append((s, e))
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(sweep_tp, op=dist.ReduceOp.SUM)
         dist.all_reduce(sweep_fp, op=dist.ReduceOp.SUM)
         dist.all_reduce(sweep_fn, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sweep_powa_negative, op=dist.ReduceOp.SUM)
 
-    f1s = []
-    ps_, rs_ = [], []
+    val_f1s, val_ps, val_rs = [], [], []
     for i in range(thr_grid.numel()):
-        tp = sweep_tp[i].item(); fp = sweep_fp[i].item(); fn = sweep_fn[i].item()
-        p = tp / max(1, tp + fp); r_ = (tp / max(1, tp + fn))**0.5
-        f1 = 2 * p * r_ / max(1e-8, p + r_)
-        f1s.append(f1); ps_.append(p); rs_.append(r_)
-    best_i = int(torch.tensor(f1s).argmax().item())
+        tp = int(sweep_tp[i].item())
+        fp = int(sweep_fp[i].item())
+        fn = int(sweep_fn[i].item())
+        powa_negative = int(sweep_powa_negative[i].item()) if use_powa else None
+        p, r_, f1 = _compute_tsp_metrics(tp, tp + fp, tp + fn, powa_negative)
+        val_f1s.append(f1)
+        val_ps.append(p)
+        val_rs.append(r_)
+    best_i = int(torch.tensor(val_f1s).argmax().item())
     best_thr = float(thr_grid[best_i].item())
 
     def _edges_to_sorted_keys(edge_index: torch.Tensor, edge_type: torch.Tensor,
@@ -617,31 +654,27 @@ def evaluate(cfg, vq_model: VQpretrain, diff_model: TokenDiffusion, data_incompl
         if sorted_set.size == 0 or keys.size == 0:
             return np.zeros((keys.size,), dtype=bool)
         pos = np.searchsorted(sorted_set, keys)
-        hit = (pos < sorted_set.size) & (sorted_set[pos] == keys)
+        hit = np.zeros(keys.shape, dtype=bool)
+        valid = pos < sorted_set.size
+        hit[valid] = sorted_set[pos[valid]] == keys[valid]
         return hit
     
-    # Use best_thr for open-set statistics
     pred_total = 0
-    correct_total_by_label = int(sweep_tp[best_i].item())
     correct_total_in_test = 0
     wrong_open_replace_count = 0
     rs_scores = []
     rs_correct = []
-    rs_keys = []  # For tie-break (sort by key when scores are equal)
-
-    pred_total = 0
-    correct_total_in_test = 0
-    wrong_open_replace_count = 0
+    rs_keys = []
 
     for idx, (s, e) in enumerate(cached_ranges):
-        probs = cached_tail_prob_cpu[idx]  # (b,R,N) float16 on CPU
+        probs = cached_tail_prob_cpu[idx]
         preds = probs > best_thr
         k = int(preds.sum().item())
         pred_total += k
         if k == 0:
             continue
 
-        nz = preds.nonzero(as_tuple=False)  # (K,3) columns: b,r,t (CPU)
+        nz = preds.nonzero(as_tuple=False)
         b = nz[:, 0].to(torch.int64)
         r = nz[:, 1].to(torch.int64)
         t = nz[:, 2].to(torch.int64)
@@ -649,29 +682,22 @@ def evaluate(cfg, vq_model: VQpretrain, diff_model: TokenDiffusion, data_incompl
 
         scores = probs[preds].to(torch.float32).numpy()
         keys = ((h * num_rel + r) * num_nodes + t).to(torch.int64).numpy()
-
-        # Explicitly exclude train+valid(+inverse edges) (theoretically already suppressed by forbid mask, but filter again here as requested)
-        
-        h = h.numpy(); r = r.numpy(); t = t.numpy()
+        h = h.numpy()
+        r = r.numpy()
+        t = t.numpy()
 
         is_correct = _isin_sorted(keys, test_keys_sorted)
         correct_total_in_test += int(is_correct.sum())
-
         rs_scores.append(scores.astype(np.float32, copy=False))
         rs_correct.append(is_correct)
         rs_keys.append(keys)
 
-        # If wrong_open_replace_count still needed: only iterate over the wrong part (reduce loop amount)
-        wrong_idx = np.nonzero(~is_correct)[0]
-        for j in wrong_idx:
-            h_idx = int(h[j]); r_pred = int(r[j]); t_idx = int(t[j])
-            rels_exist = joint_ht2rels.get((h_idx, t_idx), None)
-            if not rels_exist:
-                continue
-            if any((not _relations_correspond(r_exist, r_pred, rel_map)) for r_exist in rels_exist):
-                wrong_open_replace_count += 1
+        if use_powa:
+            wrong_idx = np.nonzero(~is_correct)[0]
+            wrong_open_replace_count += _count_powa_negative(
+                h[wrong_idx], r[wrong_idx], t[wrong_idx], test_pair_rel_map, rel_map
+            )
 
-    # --- Compute RS_TSP ---
     if len(rs_scores) == 0:
         rs_tsp = 0.0
         rs_tsp_norm = 0.0
@@ -681,36 +707,49 @@ def evaluate(cfg, vq_model: VQpretrain, diff_model: TokenDiffusion, data_incompl
         correct_all = np.concatenate(rs_correct, axis=0)
         keys_all = np.concatenate(rs_keys, axis=0)
         rs_K = int(scores_all.shape[0])
-
-        # Score descending; tie-break by key ascending for determinism
         order = np.lexsort((keys_all, -scores_all))
-
         sign = np.where(correct_all, 1.0, -1.0).astype(np.float32, copy=False)
-        w = (1.0 / (np.arange(rs_K, dtype=np.float32) + 1.0))
+        w = 1.0 / (np.arange(rs_K, dtype=np.float32) + 1.0)
         rs_tsp = float(np.sum(sign[order] * w))
-        rs_tsp_norm = float(rs_tsp / float(np.sum(w)))  # Optional: normalize to [-1,1]
+        rs_tsp_norm = float(rs_tsp / float(np.sum(w)))
 
     test_total = len(test_triples)
     test_total_with_reverse = int(label_graph.edge_index.size(1))
+    powa_negative = wrong_open_replace_count if use_powa else None
+    test_p, test_r, test_f1 = _compute_tsp_metrics(
+        correct_total_in_test, pred_total, test_total_with_reverse, powa_negative
+    )
+    test_cwa_p = correct_total_in_test / max(1, pred_total)
+    test_powa_p = (
+        correct_total_in_test / max(1, correct_total_in_test + wrong_open_replace_count)
+        if use_powa else test_cwa_p
+    )
 
-    logger.warning(f"[{tb_tag}] threshold sweep best_thr={best_thr:.3f}  best_F1={f1s[best_i]:.4f} best_P={ps_[best_i]:.4f} best_R={rs_[best_i]:.4f}")
     logger.warning(
-        f"[{tb_tag}] triples@best_thr pred_total={pred_total} "
-        f"correct_in_test={correct_total_in_test} "
-        f"correct_by_eval_label={correct_total_by_label} "
-        f"test_total={test_total} "
-        f"test_total_with_reverse={test_total_with_reverse} "
-        f"wrong_open_replace_count={wrong_open_replace_count}"
-        f"[{tb_tag}] RS_TSP={rs_tsp:.6f} RS_TSP_norm={rs_tsp_norm:.6f} K={rs_K}"
+        f"[{tb_tag}] {threshold_split} threshold best_thr={best_thr:.7f} "
+        f"best_F_TSP={val_f1s[best_i]:.4f} best_JPrecision={val_ps[best_i]:.4f} "
+        f"best_STRecall={val_rs[best_i]:.4f} assumption={assumption}"
+    )
+    logger.warning(
+        f"[{tb_tag}] test JPrecision={test_p:.4f} STRecall={test_r:.4f} F_TSP={test_f1:.4f} "
+        f"CWA_Precision={test_cwa_p:.4f} POWA_Precision={test_powa_p:.4f} "
+        f"pred_total={pred_total} correct_in_test={correct_total_in_test} "
+        f"test_total={test_total} test_total_with_reverse={test_total_with_reverse} "
+        f"wrong_open_replace_count={wrong_open_replace_count} "
+        f"RS_TSP={rs_tsp:.6f} RS_TSP_norm={rs_tsp_norm:.6f} K={rs_K}"
     )
     if writer is not None:
         writer.add_scalar(f"{tb_tag}/best_thr", best_thr, step)
-        writer.add_scalar(f"{tb_tag}/best_F1", f1s[best_i], step)
-        writer.add_scalar(f"{tb_tag}/best_P", ps_[best_i], step)
-        writer.add_scalar(f"{tb_tag}/best_R", rs_[best_i], step)
+        writer.add_scalar(f"{tb_tag}/{'val' if threshold_split == 'validation' else 'test'}_best_F_TSP", val_f1s[best_i], step)
+        writer.add_scalar(f"{tb_tag}/{'val' if threshold_split == 'validation' else 'test'}_best_JPrecision", val_ps[best_i], step)
+        writer.add_scalar(f"{tb_tag}/{'val' if threshold_split == 'validation' else 'test'}_best_STRecall", val_rs[best_i], step)
+        writer.add_scalar(f"{tb_tag}/JPrecision", test_p, step)
+        writer.add_scalar(f"{tb_tag}/STRecall", test_r, step)
+        writer.add_scalar(f"{tb_tag}/F_TSP", test_f1, step)
+        writer.add_scalar(f"{tb_tag}/CWA_Precision", test_cwa_p, step)
+        writer.add_scalar(f"{tb_tag}/POWA_Precision", test_powa_p, step)
         writer.add_scalar(f"{tb_tag}/pred_total", pred_total, step)
         writer.add_scalar(f"{tb_tag}/correct_in_test", correct_total_in_test, step)
-        writer.add_scalar(f"{tb_tag}/correct_by_eval_label", correct_total_by_label, step)
         writer.add_scalar(f"{tb_tag}/test_total", test_total, step)
         writer.add_scalar(f"{tb_tag}/test_total_with_reverse", test_total_with_reverse, step)
         writer.add_scalar(f"{tb_tag}/wrong_open_replace_count", wrong_open_replace_count, step)
@@ -718,7 +757,12 @@ def evaluate(cfg, vq_model: VQpretrain, diff_model: TokenDiffusion, data_incompl
         writer.add_scalar(f"{tb_tag}/RS_TSP_norm", rs_tsp_norm, step)
         writer.add_scalar(f"{tb_tag}/RS_TSP_K", rs_K, step)
 
-    return ps_[best_i], rs_[best_i], f1s[best_i], best_thr
+    if return_details:
+        return {"validation_f_tsp": val_f1s[best_i] if threshold_split == "validation" else None,
+                "selection_f_tsp": val_f1s[best_i], "threshold_selection_split": threshold_split,
+                "threshold": best_thr, "test_jprecision": test_p,
+                "test_strecall": test_r, "test_f_tsp": test_f1}
+    return test_p, test_r, test_f1, best_thr
 
 
 def build_edge_drop_scheduler(cfg, total_steps: int, base_drop: float):
@@ -752,6 +796,16 @@ def build_edge_drop_scheduler(cfg, total_steps: int, base_drop: float):
             return (1 - t) * start + t * end
 
     return ratio_at
+
+def save_diffusion_checkpoint(path, model, optimizer, scaler, cfg, epoch, metrics):
+    state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+             "scaler": scaler.state_dict(), "config": dict(cfg), "epoch": epoch,
+             "metrics": metrics, "stage1_checkpoint": cfg.checkpoint,
+             "selection_metric": "validation_f_tsp" if metrics["threshold_selection_split"] == "validation" else "test_threshold_f_tsp"}
+    temporary = path + ".tmp"
+    torch.save(state, temporary)
+    os.replace(temporary, path)
+
 
 def main():
     args, vars_ = util.parse_args()
@@ -795,16 +849,32 @@ def main():
         tokens=num_rel,
         T=getattr(cfg, "diffusion", {}).get("T", 1000),
         hidden=getattr(cfg, "diffusion", {}).get("hidden", 128),
-        layers=getattr(cfg, "diffusion", {}).get("layers", 3),
+        layers=getattr(cfg, "diffusion", {}).get("layers", getattr(cfg, "diffusion", {}).get("num_layers", 3)),
         time_dim=getattr(cfg, "diffusion", {}).get("time_dim", 64),
         dropout=getattr(cfg, "diffusion", {}).get("dropout", 0.1),
         relconfig=cfg.model.relation_model,
+        use_ou=cfg.diffusion.get("use_ou", False),
+        kappa=cfg.diffusion.get("kappa", 4.0),
+        sigma_inf=cfg.diffusion.get("sigma_inf", 1.0),
+        eta=cfg.diffusion.get("eta", 0.9),
+        use_ffn=cfg.diffusion.get("use_ffn", True),
+        use_relation_attn=cfg.diffusion.get("use_relation_attn", True),
+        use_node_attn=cfg.diffusion.get("use_node_attn", True),
+        mixer=cfg.diffusion.get("mixer", "linear_attention"),
+        node_mixing_size=cfg.diffusion.get("node_mixing_size", 512),
     ).to(device)
-    
 
-    
+    # LinearAttention.promlp is never called by forward. Exclude this inactive
+    # branch from optimization/checkpoints while preserving initialization order.
+    for block in list(diff.net.relation_attn) + list(diff.net.node_attn):
+        if hasattr(block, "promlp"):
+            del block.promlp
 
-    opt = optim.AdamW(diff.parameters(), lr=getattr(cfg.optimizer, "lr", 1e-4), weight_decay=1e-2)
+    opt_cfg = dict(cfg.optimizer)
+    opt_cls = opt_cfg.pop("class", "AdamW")
+    if opt_cls not in ("Adam", "AdamW"):
+        raise ValueError(f"Unsupported optimizer: {opt_cls}. Choose Adam or AdamW.")
+    opt = getattr(optim, opt_cls)(diff.parameters(), **opt_cfg)
     scaler = torch.cuda.amp.GradScaler(enabled=True)
 
     world_size = util.get_world_size()
@@ -826,16 +896,21 @@ def main():
     world_size = util.get_world_size()
 
     global_step = 0
+    best_validation_f1 = float("-inf")
+    last_metrics = None
     for epoch in range(epochs):
         diff.train()
         losses = []
 
-        # Construct uncomplete/complete graph
-        ratio_uncomplete = float(getattr(cfg, "augment", {}).get("ratio_uncomplete", 0.75))
-        extra_lo = float(getattr(cfg, "augment", {}).get("complete_extra_min", 0.2))
-        extra_hi = float(getattr(cfg, "augment", {}).get("complete_extra_max", 0.25))
+        # Construct observed/target graphs with Tobs subset of Ttar subset of Ttrain
+        ratio_target_min = float(getattr(cfg, "augment", {}).get("ratio_target_min", 0.7))
+        ratio_target_max = float(getattr(cfg, "augment", {}).get("ratio_target_max", 1.0))
+        ratio_observed = float(getattr(cfg, "augment", {}).get("ratio_observed", 0.8))
         uncompletekg, completekg = split_uncomplete_complete(
-            train_data, ratio_uncomplete=ratio_uncomplete, extra_ratio_range=(extra_lo, extra_hi), device=device
+            train_data,
+            ratio_target_range=(ratio_target_min, ratio_target_max),
+            ratio_observed=ratio_observed,
+            device=device,
         )
         uncompletekg = uncompletekg.to(device)
         completekg = completekg.to(device)
@@ -909,15 +984,24 @@ def main():
             backup = {n: p.detach().clone() for n, p in bare.named_parameters()}
             try:
                 joint_graph = build_joint_target_graph(train_data, test_data, device=device, reverse=True).to(device)
-                prec, rec, f1, thr = evaluate(
+                last_metrics = evaluate(
                     cfg, vq_model, bare, train_data, joint_graph, device, logger,valid_data=valid_data,
-                    writer=writer, test_data=test_data, step=epoch, guidance_scale=0.5, use_soft_vq=True
+                    writer=writer, test_data=test_data, step=epoch, guidance_scale=0.5, use_soft_vq=True, return_details=True
                 )
             finally:
                 for n, p in bare.named_parameters():
                     p.data.copy_(backup[n])
-            
+            with open("metrics.jsonl", "a") as fout:
+                fout.write(json.dumps({"epoch": epoch + 1, **last_metrics}) + "\n")
+            if math.isfinite(last_metrics["selection_f_tsp"]) and last_metrics["selection_f_tsp"] > best_validation_f1:
+                best_validation_f1 = last_metrics["selection_f_tsp"]
+                save_diffusion_checkpoint("diffusion_best.pth", bare, opt, scaler, cfg,
+                                          epoch + 1, last_metrics)
+                logger.warning(f"[Checkpoint] diffusion_best.pth epoch={epoch + 1} selection_F_TSP={best_validation_f1:.6f} split={last_metrics['threshold_selection_split']}")
 
+    if rank == 0:
+        bare = diff.module if isinstance(diff, nn.parallel.DistributedDataParallel) else diff
+        save_diffusion_checkpoint("diffusion_last.pth", bare, opt, scaler, cfg, epochs, last_metrics)
     if writer:
         writer.flush()
         writer.close()

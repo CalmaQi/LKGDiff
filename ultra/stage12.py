@@ -333,35 +333,10 @@ class InverseAdjacencyDecoder(nn.Module):
         Output:
           logits_sparse: (E,)
         """
-        # --- MLP path ---
-        h = head_vec[b_idx, r_idx]  # (E, D)
-        # Derive through deprojector up to second-last layer
-        for layer in self.deprojector[:-1]:
-            h = layer(h)
-        # Last layer is nn.Linear(hidden_dim, num_nodes)
-        last_layer = self.deprojector[-1]
-        weight = last_layer.weight[t_idx]  # (E, hidden_dim)
-        bias = last_layer.bias[t_idx]      # (E,)
-        logits_mlp = (h * weight).sum(dim=-1) + bias  # (E,)
-
-        # --- Factorized path ---
-        rel_factors = self.rel_factor(head_vec)   # (B, R, k)
-        rf_e = rel_factors[b_idx, r_idx]          # (E, k)
-        tb_e = self.tail_basis[t_idx]             # (E, k)
-        logits_fact = (rf_e * tb_e).sum(dim=-1)   # (E,)
-
-        # --- Mix ---
-        mix_alpha = torch.sigmoid(self._mix_logit)
-        logits_sparse = mix_alpha * logits_mlp + (1.0 - mix_alpha) * logits_fact
-
-        # --- Lightweight Bias ---
-        rb = self.rel_bias_mlp(head_vec).squeeze(-1)  # (B, R)
-        rb_e = rb[b_idx, r_idx]                       # (E,)
-        tb_e_bias = self.tail_bias[t_idx]             # (E,)
-
-        logits_sparse = logits_sparse + rb_e + tb_e_bias
-
-        return logits_sparse
+        # Decode each head/relation once instead of expanding its hidden features
+        # for every sampled tail. CFamily's full logits fit comfortably in memory.
+        logits = self.forward(head_vec)
+        return logits[b_idx, r_idx, t_idx]
 
 
 
@@ -521,7 +496,7 @@ class VQGANFCGraph(nn.Module):
     """
     Pure VQ-VAE reconstruction (empty class removed):
       encoder (tiny tokens) -> RVQ -> FC decoder -> logits(B,R,N)
-      Loss: BCEWithLogits + beta*commit + usage_KL(vq)
+      Loss: BCEWithLogits + beta*commit + optional regularization terms
     Enhancements:
       - Relation Applicability Gate: predict per-relation applicability prior and inject as logit bias
       - Decoder adds low-rank factorized path for better generalization
@@ -539,10 +514,14 @@ class VQGANFCGraph(nn.Module):
         tokens: int = 16,
         z_dim: int = 16,
         num_quantizers: int = 4,
+        commitment_loss_weight: float = 1.0,
         ema: bool = True,
         decay: float = 0.99,
         beta: float = 0.25,
         usage_lambda: float = 1e-2,
+        use_usage_loss: bool = False,
+        use_sparsity_loss: bool = False,
+        use_degree_loss: bool = False,
         temp: float = 1.0,
         # Training/loss hyperparameters
         label_smoothing: float = 0.00,
@@ -561,7 +540,7 @@ class VQGANFCGraph(nn.Module):
         factor_rank: int = 64,
         token_dropout: float = 0.05,
         # -------- Sparse prior regularization (only affects loss during training, does not change forward) --------
-        sparsity_lambda: float = 1e-1,         # >0 enables; suggested 1e-4 ~ 1e-2
+        sparsity_lambda: float = 1e-1,         # used when use_sparsity_loss=True; suggested 1e-4 ~ 1e-2
         sparsity_mode: str = "kl",            # 'kl' | 'mse' | 'l1'
         sparsity_target: Optional[float] = None,  # If given, use this global target density; otherwise use EMA
         sparsity_decay: float = 0.99,
@@ -588,7 +567,11 @@ class VQGANFCGraph(nn.Module):
         self.tokens = int(tokens)
         self.z_dim = int(z_dim)
         self.beta = float(beta)
+        self.commitment_loss_weight = float(commitment_loss_weight)
         self.usage_lambda = float(usage_lambda)
+        self.use_usage_loss = bool(use_usage_loss)
+        self.use_sparsity_loss = bool(use_sparsity_loss)
+        self.use_degree_loss = bool(use_degree_loss)
         self.temp = float(temp)
         self.label_smoothing = float(label_smoothing)
         self.pos_weight_max = float(pos_weight_max)
@@ -768,7 +751,7 @@ class VQGANFCGraph(nn.Module):
         assert ent_embed is not None, "decode_tokens requires z_q or ent_embed"
         return ent_embed
 
-    def compute_sparse_logits_and_labels(self, head_vec: torch.Tensor, batch: torch.Tensor, edge_index: torch.Tensor, edge_type: torch.Tensor, B: int, device):
+    def compute_sparse_logits_and_labels(self, head_vec: torch.Tensor, batch: torch.Tensor, edge_index: torch.Tensor, edge_type: torch.Tensor, B: int, device, return_tail_indices: bool = False, known_labels=None):
         H, T = edge_index[0], edge_index[1]
         R = edge_type
         head2b = torch.full((self.num_nodes,), -1, device=device, dtype=torch.long)
@@ -789,6 +772,12 @@ class VQGANFCGraph(nn.Module):
             neg_r = pos_r.repeat(self.num_neg_samples)
             neg_t = torch.randint(0, self.num_nodes, (num_neg_target,), device=device, dtype=torch.long)
 
+            # Reject false negatives against all positives of the current head batch.
+            if known_labels is None:
+                known_labels = self.build_labels(batch, edge_index, edge_type, B, device)
+            keep = known_labels[neg_b, neg_r, neg_t] < 0.5
+            neg_b, neg_r, neg_t = neg_b[keep], neg_r[keep], neg_t[keep]
+            num_neg_target = neg_t.numel()
             eval_b = torch.cat([pos_b, neg_b])
             eval_r = torch.cat([pos_r, neg_r])
             eval_t = torch.cat([pos_t, neg_t])
@@ -814,6 +803,8 @@ class VQGANFCGraph(nn.Module):
         if self.label_smoothing > 0.0:
             labels = (1.0 - self.label_smoothing) * labels + 1.0 / float(self.num_nodes)
 
+        if return_tail_indices:
+            return logits_sparse, labels, eval_t
         return logits_sparse, labels
 
     def compute_logits(self, head_vec: torch.Tensor) -> torch.Tensor:
@@ -867,6 +858,19 @@ class VQGANFCGraph(nn.Module):
             elif isinstance(pos_weight_vec, torch.Tensor) and pos_weight_vec.numel() == 1:
                 pos_weight_vec = pos_weight_vec.expand(C)
         return pos_weight_vec
+
+    def compute_sampled_pos_weight(self, targets, tails, dtype, pos_weight=None):
+        """Per-tail negative/positive ratio in the actual sampled batch, capped at 1e4."""
+        with torch.no_grad():
+            if pos_weight is None:
+                positive = targets > 0.5
+                pos = torch.bincount(tails[positive], minlength=self.num_nodes).to(dtype)
+                neg = torch.bincount(tails[~positive], minlength=self.num_nodes).to(dtype)
+                weight = neg.clamp_min(1) / pos.clamp_min(1)
+            else:
+                weight = torch.as_tensor(pos_weight, device=tails.device, dtype=dtype)
+                weight = weight.expand(self.num_nodes)
+            return weight.detach().clamp(min=0, max=min(self.pos_weight_max, 10000.0))
 
     def recon_loss(self, logits: torch.Tensor, labels: torch.Tensor, pos_weight_vec: torch.Tensor):
         bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight_vec)
@@ -970,17 +974,30 @@ class VQGANFCGraph(nn.Module):
         is_sparse_mode = (hasattr(self, 'num_neg_samples') and self.num_neg_samples > 0)
 
         if is_sparse_mode:
-            # In this mode, do not create B*R*N prediction tensor; compute logits only for sampled positives and negatives
-            sparse_logits, sparse_labels = self.compute_sparse_logits_and_labels(
-                head_fake, batch, edge_index, edge_type, B, device
-            )
-            loss_recon = F.binary_cross_entropy_with_logits(sparse_logits, sparse_labels, reduction='mean')
-
-            # For subsequent statistics, infer full logits under no_grad with very low overhead
             with torch.no_grad():
-                logits = self.compute_logits(head_fake)
                 labels = self.build_labels(batch, edge_index, edge_type, B, device)
-                pos_weight_vec = torch.tensor([1.0], device=device)
+            sparse_logits, sparse_labels, sampled_tails = self.compute_sparse_logits_and_labels(
+                head_fake, batch, edge_index, edge_type, B, device,
+                return_tail_indices=True, known_labels=labels,
+            )
+            pos_weight_vec = self.compute_sampled_pos_weight(
+                sparse_labels, sampled_tails, sparse_logits.dtype, pos_weight
+            )
+            if sparse_logits.numel():
+                loss_recon = F.binary_cross_entropy_with_logits(
+                    sparse_logits, sparse_labels,
+                    pos_weight=pos_weight_vec[sampled_tails], reduction='mean',
+                )
+            else:
+                loss_recon = sparse_logits.sum()  # Empty graph: differentiable zero, not NaN.
+
+            # Full-tail statistics need gradients when density losses are enabled.
+            density_loss_enabled = self.training and (
+                (self.use_degree_loss and self.degree_loss_lambda > 0.0)
+                or (self.use_sparsity_loss and self.sparsity_lambda > 0.0)
+            )
+            with torch.set_grad_enabled(torch.is_grad_enabled() and density_loss_enabled):
+                logits = self.compute_logits(head_fake)
         else:
             # Full branch B*R*N
             labels = self.build_labels(batch, edge_index, edge_type, B, device)
@@ -1014,7 +1031,7 @@ class VQGANFCGraph(nn.Module):
             return d_loss, stats
         # -------- Degree alignment (density-controllable soft constraint) --------
         loss_degree = torch.zeros((), device=device, dtype=loss_recon.dtype)
-        if self.training and self.degree_loss_lambda > 0.0 and not is_sparse_mode:
+        if self.training and self.use_degree_loss and self.degree_loss_lambda > 0.0:
             probs = torch.sigmoid(logits)
             deg_true_br = labels.sum(dim=-1)          # (B,R)
             deg_pred_br = probs.sum(dim=-1)           # (B,R)
@@ -1026,22 +1043,20 @@ class VQGANFCGraph(nn.Module):
 
         # -------- Sparse prior regularization (only affects loss) --------
         loss_sparse = torch.zeros((), device=device, dtype=loss_recon.dtype)
-        if self.training and self.sparsity_lambda > 0.0 and not is_sparse_mode:
+        if self.training and self.use_sparsity_loss and self.sparsity_lambda > 0.0:
+            probs = torch.sigmoid(logits)
             # Update EMA prior
             self._update_rel_prior(labels)
             prior_q = self._get_rel_prior(device=device, dtype=loss_recon.dtype)
             loss_sparse = self._sparsity_regularizer(probs, prior_q) * self.sparsity_lambda
 
-
-
-        # Total loss (does not change original main term, only adds regularization)
-        loss_g = (
-            loss_recon
-            + self.beta * commit_loss
-            + (self.usage_lambda * usage_kl if self.mode == "vq" else 0.0)
-            + loss_sparse
-            + loss_degree if self.degree_loss_lambda > 0.0 else 0.0
-        )
+        loss_g = loss_recon + self.beta * self.commitment_loss_weight * commit_loss
+        if self.use_usage_loss and self.mode == "vq":
+            loss_g = loss_g + self.usage_lambda * usage_kl
+        if self.use_sparsity_loss:
+            loss_g = loss_g + loss_sparse
+        if self.use_degree_loss:
+            loss_g = loss_g + loss_degree
 
         if self.adv_lambda > 0:
             loss_g = loss_g + self.adv_lambda * g_adv_loss
@@ -1049,6 +1064,8 @@ class VQGANFCGraph(nn.Module):
         stats = dict(
                 loss_recon=float(loss_recon.detach()),
                 loss_commit=float(commit_loss.detach()),
+                loss_sparse=float(loss_sparse.detach()),
+                loss_degree=float(loss_degree.detach()),
                 loss_usage_kl=float((usage_kl if self.mode == "vq" else torch.tensor(0.0, device=device)).detach()),
                 loss_g_adv=float(g_adv_loss.detach()),
                 gate_mean=float(self._last_gate.detach()),
@@ -1119,6 +1136,8 @@ class VQpretrain(nn.Module):
         self.num_rel = int(rel_cfg["num_relation"])
 
         vq_cfg = dict(vq_model_cfg)
+        if "num_residual_quantizers" in vq_cfg:
+            vq_cfg["num_quantizers"] = vq_cfg.pop("num_residual_quantizers")
         encoder_hidden = vq_cfg.pop("encoder_hidden_dim", None)
         encoder_dropout = vq_cfg.pop("encoder_dropout", 0.1)
         edge_dropout = vq_cfg.pop("encoder_edge_dropout", 0.0)

@@ -1,0 +1,12 @@
+.*
+__pycache__/
+*.py[cod]
+*.[pP][dD][fF]
+*.pth
+*.pt
+*.ckpt
+experiments/
+output/
+output_diff/
+runs/
+*.log

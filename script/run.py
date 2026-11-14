@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter  # added
 import numpy as np  
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from ultra import tasks, util
+from ultra import util
 
 from ultra.stage12 import VQpretrain
 from collections import defaultdict
@@ -847,8 +847,29 @@ def build_edge_drop_scheduler(cfg, total_steps: int, base_drop: float):
 separator = ">" * 30
 line = "-" * 30
 
+def save_best_checkpoint(model, optimizer_g, optimizer_d, epoch, metrics, best_f1,
+                         path="model_best.pth"):
+    """Atomically replace the single best checkpoint only on a finite F1 improvement."""
+    precision, recall, f1 = map(float, metrics)
+    if not math.isfinite(f1) or f1 <= best_f1:
+        return best_f1
+    bare = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
+    state = {
+        "model": bare.state_dict(),
+        "optimizer_g": optimizer_g.state_dict(),
+        "optimizer_d": optimizer_d.state_dict() if optimizer_d is not None else None,
+        "epoch": int(epoch), "best_f1": f1,
+        "metrics": {"precision": precision, "recall": recall, "f1": f1},
+        "selection_split": "validation",
+    }
+    temporary = str(path) + ".tmp"
+    torch.save(state, temporary)
+    os.replace(temporary, path)
+    return f1
+
+
 def train_and_validate(cfg, model, train_data, test_data, device, logger, 
-                       filtered_data=None, batch_per_epoch=None, drop_ratio=0.1, writer=None):
+                       filtered_data=None, batch_per_epoch=None, drop_ratio=0.1, writer=None, valid_data=None):
     if cfg.train.num_epoch == 0:
         return
 
@@ -918,6 +939,8 @@ def train_and_validate(cfg, model, train_data, test_data, device, logger,
     vq_usage_start = float(getattr(cfg.train, "vq_usage_start", 1e-3))
 
     prev_stage = None
+    best_f1 = float("-inf")
+    selection_data = valid_data if valid_data is not None else test_data
 
     for i in range(0, cfg.train.num_epoch, step_chunk):
         parallel_model.train()
@@ -1014,15 +1037,17 @@ def train_and_validate(cfg, model, train_data, test_data, device, logger,
         if util.get_rank() == 0:
             logger.warning(">" * 30)
             logger.warning("Evaluate on valid")
-        recon_metric = test_joint(cfg, model, train_data, test_data, device=device, logger=logger, writer=writer, tb_tag="valid_joint", tb_step=epoch)
+        recon_metric = test_joint(cfg, model, train_data, selection_data, device=device, logger=logger, writer=writer, tb_tag="valid_joint", tb_step=epoch)
 
-    if util.get_rank() == 0:
-        state = {
-            "model": model.state_dict(),
-            "optimizer_g": optimizer_g.state_dict(),
-            "optimizer_d": optimizer_d.state_dict() if optimizer_d is not None else None
-        }
-        torch.save(state, "model_epoch_%d.pth" % epoch)
+        if rank == 0:
+            previous_best = best_f1
+            best_f1 = save_best_checkpoint(
+                model, optimizer_g, optimizer_d, epoch, recon_metric, best_f1
+            )
+            if best_f1 > previous_best:
+                logger.warning(f"[Checkpoint] model_best.pth epoch={epoch} valid_F1={best_f1:.6f}")
+
+    util.synchronize()
 
 @torch.no_grad()
 def _build_forbidden_mask_for_heads(data: Data, batch_heads: torch.Tensor, num_rel: int,
@@ -1630,10 +1655,15 @@ if __name__ == "__main__":
     val_filtered_data = val_filtered_data.to(device)
     test_filtered_data = test_filtered_data.to(device)
     
-    train_and_validate(cfg, model, train_data, test_data, filtered_data=val_filtered_data, device=device, batch_per_epoch=cfg.train.batch_per_epoch, logger=logger,writer=writer)
+    train_and_validate(cfg, model, train_data, test_data, filtered_data=val_filtered_data, device=device, batch_per_epoch=cfg.train.batch_per_epoch, logger=logger,writer=writer, valid_data=valid_data)
     if util.get_rank() == 0:
         logger.warning(separator)
-        logger.warning("Evaluate joint (train+test context) with metrics on test triples only")
+        logger.warning("Evaluate best validation checkpoint on test triples")
+    if os.path.exists("model_best.pth"):
+        state = torch.load("model_best.pth", map_location=device)
+        model.load_state_dict(state["model"])
+        test_joint(cfg, model, train_data, test_data, device, logger,
+                   writer=writer, tb_tag="test_joint", tb_step=state["epoch"])
 
     if writer is not None:
         writer.flush()

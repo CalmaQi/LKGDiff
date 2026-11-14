@@ -36,6 +36,10 @@ model:
     pos_weight_max: 5000000
     usage_lambda: 0.05
     beta: 0.25
+    num_neg_samples: 256
+    use_usage_loss: no
+    use_sparsity_loss: no
+    use_degree_loss: no
     has_empty_class: no
     ema: no
     # reasoning_enabled: no
@@ -55,8 +59,11 @@ task:
   adversarial_temperature: 1
   metric: [mr, mrr, hits@1, hits@3, hits@10]
 
+evaluation:
+  assumption: rs_powa
+
 optimizer:
-  class: AdamW
+  class: Adam
   lr: 5.0e-4
   # lr: 5.0e-5
 
@@ -67,6 +74,9 @@ scheduler:
   min_lr_ratio: 0.1
 
 augment:
+  ratio_target_min: 0.7
+  ratio_target_max: 1.0
+  ratio_observed: 0.8
   edge_drop: 0.99
   edge_drop_schedule:
     mode: linear   

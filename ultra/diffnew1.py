@@ -29,8 +29,13 @@ def mr_ou_schedule(T: int, kappa: float = 4.0, sigma_inf: float = 1.0) -> Tuple[
       alphas: (T,)
       sigmas: (T,)
     """
-    # Linear-DDPM schedule.  Keep the old function name for checkpoint/API
-    # compatibility; returned alphas are cumulative alpha-bars.
+    tau = torch.linspace(0.0, 1.0, steps=T, dtype=torch.float32)
+    alphas = torch.exp(-kappa * tau).clamp(1e-6, 1.0)
+    sigmas = sigma_inf * torch.sqrt(torch.clamp(1.0 - alphas ** 2, min=0.0))
+    return alphas.float(), sigmas.float()
+
+
+def ddpm_schedule(T: int) -> Tuple[torch.Tensor, torch.Tensor]:
     beta = torch.linspace(1e-4, 2e-2, steps=T, dtype=torch.float32)
     alphas = torch.cumprod(1.0 - beta, dim=0).clamp(1e-6, 1.0)
     sigmas = torch.sqrt(torch.clamp(1.0 - alphas, min=0.0))
@@ -256,6 +261,31 @@ class TokenMixMLP(nn.Module):
         h = x.permute(0, 1, 3, 2).reshape(B * N * C, T)
         h = h + self.net(h)
         return h.reshape(B, N, C, T).permute(0, 1, 3, 2).contiguous()   
+class AxisTokenMixMLP(nn.Module):
+    """MLP mixing along relations or a fixed-size node chunk; returns a residual delta."""
+    def __init__(self, length: int, axis: str, dropout: float = 0.0):
+        super().__init__()
+        self.length = int(length)
+        self.axis = axis
+        self.net = nn.Sequential(
+            nn.LayerNorm(self.length),
+            nn.Linear(self.length, self.length * 2),
+            nn.SiLU(), nn.Dropout(dropout),
+            nn.Linear(self.length * 2, self.length),
+        )
+
+    def forward(self, x):
+        # Put the mixing axis last so each channel is mixed independently.
+        h = x.permute(0, 1, 3, 2) if self.axis == "tokens" else x.permute(0, 2, 3, 1)
+        size = h.shape[-1]
+        if size > self.length:
+            raise ValueError(f"{self.axis} sequence {size} exceeds mixing size {self.length}")
+        h = F.pad(h, (0, self.length - size))
+        h = self.net(h)[..., :size]
+        return (h.permute(0, 1, 3, 2) if self.axis == "tokens"
+                else h.permute(0, 3, 1, 2)).contiguous()
+
+
 class MergeDenoiser(nn.Module):
     """
     Fusion module:
@@ -275,6 +305,11 @@ class MergeDenoiser(nn.Module):
         heads: int = 4,
         dim_head: int = 64,
         dropout: float = 0.0,
+        use_ffn: bool = True,
+        use_relation_attn: bool = True,
+        use_node_attn: bool = True,
+        mixer: str = "linear_attention",
+        node_mixing_size: int = 512,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -287,7 +322,7 @@ class MergeDenoiser(nn.Module):
 
         blocks = []
         for _ in range(layers):
-            channel_mlp = ChannelMLP(hidden, mult=2, dropout=dropout)
+            channel_mlp = ChannelMLP(hidden, mult=2, dropout=dropout) if use_ffn else nn.Identity()
             token_channel_mlp = TokenMixMLP(tokens=tokens, dropout=dropout)
             blocks.append(nn.ModuleList([token_channel_mlp, channel_mlp]))
         
@@ -295,15 +330,20 @@ class MergeDenoiser(nn.Module):
 
         # Relation-wise attention mixes the relation/token axis; node-wise
         # attention mixes heads/nodes. Both use the linear-attention kernel.
+        if mixer not in ("linear_attention", "tokenmix_mlp"):
+            raise ValueError(f"Unknown mixer: {mixer}")
+        self.mixer = mixer
+        self.use_relation_attn = bool(use_relation_attn)
+        self.use_node_attn = bool(use_node_attn)
         self.relation_attn = nn.ModuleList([
-            LinearAttention(hidden, tlen=tokens, heads=heads,
-                            dim_head=dim_head, axis="tokens")
-            for _ in range(layers)
+            LinearAttention(hidden, tlen=tokens, heads=heads, dim_head=dim_head, axis="tokens")
+            if mixer == "linear_attention" else AxisTokenMixMLP(tokens, "tokens", dropout)
+            for _ in range(layers if self.use_relation_attn else 0)
         ])
         self.node_attn = nn.ModuleList([
-            LinearAttention(hidden, tlen=tokens, heads=heads,
-                            dim_head=dim_head, axis="nodes")
-            for _ in range(layers)
+            LinearAttention(hidden, tlen=tokens, heads=heads, dim_head=dim_head, axis="nodes")
+            if mixer == "linear_attention" else AxisTokenMixMLP(node_mixing_size, "nodes", dropout)
+            for _ in range(layers if self.use_node_attn else 0)
         ])
 
         self.proj_out = nn.Sequential(
@@ -350,8 +390,10 @@ class MergeDenoiser(nn.Module):
 
             for i, (attn_t, ffn) in enumerate(self.blocks):
                 # relation-wise and node-wise linear attention residuals
-                h = h + self.relation_attn[i](F.layer_norm(h, (h.shape[-1],)))
-                h = h + self.node_attn[i](F.layer_norm(h, (h.shape[-1],)))
+                if self.use_relation_attn:
+                    h = h + self.relation_attn[i](F.layer_norm(h, (h.shape[-1],)))
+                if self.use_node_attn:
+                    h = h + self.node_attn[i](F.layer_norm(h, (h.shape[-1],)))
                 h = attn_t(h)
                 h = ffn(h)
 
@@ -388,7 +430,13 @@ class TokenDiffusionMR(nn.Module):
         heads: int = 2,
         dim_head: int = 64,
         dropout: float = 0.0,
+        use_ffn: bool = True,
+        use_relation_attn: bool = True,
+        use_node_attn: bool = True,
+        mixer: str = "linear_attention",
+        node_mixing_size: int = 512,
         relconfig=None,
+        use_ou: bool = False,
     ):
         super().__init__()
         self.z_dim = int(z_dim)
@@ -397,12 +445,16 @@ class TokenDiffusionMR(nn.Module):
         self.kappa = float(kappa)
         self.sigma_inf = float(sigma_inf)
         self.eta = float(eta)
+        self.use_ou = bool(use_ou)
 
-        alphas, sigmas = mr_ou_schedule(self.T, kappa=self.kappa, sigma_inf=self.sigma_inf)
-        alpha_prev = torch.cat([torch.ones(1), alphas[:-1]])
-        beta = (1.0 - alphas / alpha_prev).clamp(1e-5, 0.999)
-        self.register_buffer("betas", beta)
-        self.register_buffer("alpha_prev", alpha_prev)
+        if self.use_ou:
+            alphas, sigmas = mr_ou_schedule(self.T, self.kappa, self.sigma_inf)
+        else:
+            alphas, sigmas = ddpm_schedule(self.T)
+            alpha_prev = torch.cat([torch.ones(1), alphas[:-1]])
+            beta = (1.0 - alphas / alpha_prev).clamp(1e-5, 0.999)
+            self.register_buffer("betas", beta)
+            self.register_buffer("alpha_prev", alpha_prev)
         self.register_buffer("alphas", alphas)
         self.register_buffer("sigmas", sigmas)
 
@@ -416,6 +468,8 @@ class TokenDiffusionMR(nn.Module):
             dim_head=dim_head,
             dropout=dropout,
             relconfig=relconfig,
+            use_ffn=use_ffn, mixer=mixer, node_mixing_size=node_mixing_size,
+            use_relation_attn=use_relation_attn, use_node_attn=use_node_attn,
         )
 
     @staticmethod
@@ -486,8 +540,8 @@ class TokenDiffusionMR(nn.Module):
             s_t = s_t.unsqueeze(0)
 
         noise = torch.randn_like(x0)
-        # DDPM q(x_t | x_0), with known_x0 used as the conditioning center.
-        x_t = torch.sqrt(a_t) * x0 + (1.0 - torch.sqrt(a_t)) * known_x0 + s_t * noise
+        coefficient = a_t if self.use_ou else torch.sqrt(a_t)
+        x_t = coefficient * x0 + (1.0 - coefficient) * known_x0 + s_t * noise
         return x_t, noise
 
     def predict_residual(
@@ -616,18 +670,29 @@ class TokenDiffusionMR(nn.Module):
                 num_nodes=num_nodes,
             )
 
-            # DDPM posterior q(x_{t-1}|x_t,x_0_hat), with t=0 deterministic.
-            a_bar = self.alphas[ti]
-            a_bar_prev = self.alpha_prev[ti]
-            beta_t = self.betas[ti]
-            coef_x0 = torch.sqrt(a_bar_prev) * beta_t / (1.0 - a_bar)
-            coef_xt = torch.sqrt(1.0 - beta_t) * (1.0 - a_bar_prev) / (1.0 - a_bar)
-            mean_prev = coef_x0 * x0_hat_head + coef_xt * x
-            if ti.item() > 0 and self.eta > 0.0:
-                posterior_var = beta_t * (1.0 - a_bar_prev) / (1.0 - a_bar)
-                x = mean_prev + self.eta * torch.sqrt(posterior_var.clamp_min(1e-20)) * torch.randn_like(x)
+            if self.use_ou:
+                # Match VQDiff's observation-anchored OU reverse update.
+                t_prev = torch.clamp(ti - 1, min=0)
+                a_prev = self.alphas[t_prev]
+                s_prev = self.sigmas[t_prev]
+                mean_prev = a_prev * x0_hat_head + (1.0 - a_prev) * known_head
+                if ti.item() > 0 and self.eta > 0.0:
+                    x = mean_prev + (self.eta * s_prev) * torch.randn_like(x)
+                else:
+                    x = mean_prev
             else:
-                x = mean_prev
+                # DDPM posterior q(x_{t-1}|x_t,x_0_hat), with t=0 deterministic.
+                a_bar = self.alphas[ti]
+                a_bar_prev = self.alpha_prev[ti]
+                beta_t = self.betas[ti]
+                coef_x0 = torch.sqrt(a_bar_prev) * beta_t / (1.0 - a_bar)
+                coef_xt = torch.sqrt(1.0 - beta_t) * (1.0 - a_bar_prev) / (1.0 - a_bar)
+                mean_prev = coef_x0 * x0_hat_head + coef_xt * x
+                if ti.item() > 0 and self.eta > 0.0:
+                    posterior_var = beta_t * (1.0 - a_bar_prev) / (1.0 - a_bar)
+                    x = mean_prev + self.eta * torch.sqrt(posterior_var.clamp_min(1e-20)) * torch.randn_like(x)
+                else:
+                    x = mean_prev
 
         out = x[0]  # (H,R,D)
        
